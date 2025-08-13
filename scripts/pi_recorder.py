@@ -10,6 +10,7 @@ import time
 import wave
 import pyaudio
 import threading
+from queue import Queue
 from datetime import datetime, time as dt_time
 from typing import TYPE_CHECKING, TypedDict
 import boto3
@@ -38,6 +39,10 @@ class Config(TypedDict):
     AWS_SECRET_ACCESS_KEY: str
     S3_BUCKET_NAME: str
     S3_OBJECT_KEY_PREFIX: str
+
+UPLOAD_ON_EXIT_ONLY = os.getenv("UPLOAD_ON_EXIT_ONLY", "").strip().lower() in ("1", "true", "yes", "y")
+upload_queue: "Queue[tuple[str, str]]" = Queue()
+pending_uploads: list[tuple[str, str]] = []
 
 def log_message(message: str):
     """Log messages with timestamp to daily log file"""
@@ -163,7 +168,6 @@ def record_audio(duration: int, output_filename: str, sample_rate: int, channels
         # Stop and close the stream
         stream.stop_stream()
         stream.close()
-        p.terminate()
         
         # Save the recorded data as a WAV file
         output_path = os.path.join(DIR_TEMP_RECORDINGS, output_filename)
@@ -201,12 +205,23 @@ def upload_to_s3(client: "S3Client", config: Config, file_path: str, file_name: 
     except Exception as e:
         log_message(f"[ERROR] Upload failed for {file_name}: {e}")
 
-def record_and_upload_session(config: Config, client: "S3Client"):
+def _uploader_worker(config: Config, client: "S3Client"):
+    while True:
+        item = upload_queue.get()
+        if item is None:
+            upload_queue.task_done()
+            break
+        file_path, file_name = item
+        try:
+            upload_to_s3(client, config, file_path, file_name)
+        finally:
+            upload_queue.task_done()
+
+def record_and_upload_session(config: Config, client: "S3Client", p: pyaudio.PyAudio):
     """Record for one session duration and upload"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"recording_{timestamp}.wav"
     
-    p = pyaudio.PyAudio()
     sample_rate, channels, chunk_size, device_index = get_audio_settings(p)
     log_message(
         f"Microphone config: rate={sample_rate}Hz, channels={channels}, chunk={chunk_size}, device={device_index}"
@@ -214,7 +229,12 @@ def record_and_upload_session(config: Config, client: "S3Client"):
 
     if record_audio(RECORDING_DURATION, filename, sample_rate, channels, chunk_size, device_index, p):
         file_path = os.path.join(DIR_TEMP_RECORDINGS, filename)
-        upload_to_s3(client, config, file_path, filename)
+        if UPLOAD_ON_EXIT_ONLY:
+            pending_uploads.append((file_path, filename))
+            log_message(f"Queued for upload at exit: {filename}")
+        else:
+            upload_queue.put((file_path, filename))
+            log_message(f"Enqueued upload: {filename}")
     else:
         log_message("Recording session failed, skipping upload")
 
@@ -230,6 +250,15 @@ def main():
         aws_secret_access_key=config["AWS_SECRET_ACCESS_KEY"]
     )
     
+    # Reuse one PyAudio instance for minimal gaps
+    p = pyaudio.PyAudio()
+    
+    # Start background uploader if not deferring to exit
+    uploader_thread: threading.Thread | None = None
+    if not UPLOAD_ON_EXIT_ONLY:
+        uploader_thread = threading.Thread(target=_uploader_worker, args=(config, client), daemon=True)
+        uploader_thread.start()
+    
     log_message(f"Recording hours: {RECORDING_HOURS[0]}:00 - {RECORDING_HOURS[1]}:00")
     log_message(f"Recording duration per session: {RECORDING_DURATION} seconds")
     
@@ -237,10 +266,8 @@ def main():
         try:
             if is_recording_time():
                 log_message("Starting recording session...")
-                record_and_upload_session(config, client)
+                record_and_upload_session(config, client, p)
                 
-                # Wait a bit before next session
-                # time.sleep(1)  # 1 sec break between sessions
             else:
                 # Outside recording hours, sleep longer
                 log_message("Outside recording hours, sleeping...")
@@ -252,6 +279,25 @@ def main():
         except Exception as e:
             log_message(f"[ERROR] Unexpected error: {e}")
             time.sleep(60)  # Wait before retrying
+    
+    # Graceful shutdown
+    try:
+        if UPLOAD_ON_EXIT_ONLY:
+            log_message("Uploading all pending files before exit...")
+            for file_path, file_name in list(pending_uploads):
+                upload_to_s3(client, config, file_path, file_name)
+        else:
+            log_message("Waiting for pending uploads to finish...")
+            upload_queue.join()
+            # Signal uploader thread to exit
+            upload_queue.put(None)
+            if uploader_thread is not None:
+                uploader_thread.join(timeout=5)
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main() 
