@@ -133,13 +133,11 @@ def get_audio_settings(p: pyaudio.PyAudio) -> tuple[int, int, int, int | None]:
     return sample_rate, channels, chunk_size, device_index
 
 def record_audio(duration: int, output_filename: str, sample_rate: int, channels: int, chunk_size: int, device_index: int, p: pyaudio) -> bool:
-    """Record audio for specified duration and save as WAV file"""
+    """Record audio for specified duration and save as WAV file with real-time streaming to disk"""
     try:
         # Create temp recordings directory
         os.makedirs(DIR_TEMP_RECORDINGS, exist_ok=True)
         
-
-
         # Open stream
         stream = p.open(
             format=FORMAT,
@@ -155,27 +153,32 @@ def record_audio(duration: int, output_filename: str, sample_rate: int, channels
             f"Starting recording for {duration} seconds"
         )
         
-        frames = []
-        total_chunks = int(sample_rate / chunk_size * duration)
-        for _ in range(total_chunks):
-            try:
-                data = stream.read(chunk_size, exception_on_overflow=False)
-                frames.append(data)
-            except Exception as e:
-                # Log and continue to avoid bailing out on transient overflows
-                log_message(f"[WARN] stream.read issue (continuing): {e}")
-        
-        # Stop and close the stream
-        stream.stop_stream()
-        stream.close()
-        
-        # Save the recorded data as a WAV file
+        # Open WAV file for real-time writing
         output_path = os.path.join(DIR_TEMP_RECORDINGS, output_filename)
         with wave.open(output_path, 'wb') as wf:
             wf.setnchannels(channels)
             wf.setsampwidth(p.get_sample_size(FORMAT))
             wf.setframerate(sample_rate)
-            wf.writeframes(b''.join(frames))
+            
+            # Record and write chunks in real-time
+            total_chunks = int(sample_rate / chunk_size * duration)
+            for chunk_num in range(total_chunks):
+                try:
+                    data = stream.read(chunk_size, exception_on_overflow=False)
+                    wf.writeframes(data)  # Write chunk immediately to disk
+                    
+                    # Log progress every 10 seconds
+                    if chunk_num % (10 * sample_rate // chunk_size) == 0:
+                        seconds_recorded = chunk_num * chunk_size / sample_rate
+                        log_message(f"Recording progress: {seconds_recorded:.1f}s / {duration}s")
+                        
+                except Exception as e:
+                    # Log and continue to avoid bailing out on transient overflows
+                    log_message(f"[WARN] stream.read issue (continuing): {e}")
+        
+        # Stop and close the stream
+        stream.stop_stream()
+        stream.close()
         
         log_message(f"Recording completed: {output_filename}")
         return True
