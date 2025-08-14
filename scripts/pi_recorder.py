@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 # Configuration
 RECORDING_HOURS = (0, 23)  # 9 AM to 6 PM
-RECORDING_DURATION = 60  # seconds
+RECORDING_DURATION = 3600  # seconds
 
 # Default audio settings (can be overridden by environment or device defaults)
 DEFAULT_SAMPLE_RATE = 44100
@@ -40,9 +40,7 @@ class Config(TypedDict):
     S3_BUCKET_NAME: str
     S3_OBJECT_KEY_PREFIX: str
 
-UPLOAD_ON_EXIT_ONLY = os.getenv("UPLOAD_ON_EXIT_ONLY", "").strip().lower() in ("1", "true", "yes", "y")
 upload_queue: "Queue[tuple[str, str]]" = Queue()
-pending_uploads: list[tuple[str, str]] = []
 
 def log_message(message: str):
     """Log messages with timestamp to daily log file"""
@@ -137,8 +135,6 @@ def record_audio(duration: int, output_filename: str, sample_rate: int, channels
     try:
         # Create temp recordings directory
         os.makedirs(DIR_TEMP_RECORDINGS, exist_ok=True)
-        
-
 
         # Open stream
         stream = p.open(
@@ -229,12 +225,8 @@ def record_and_upload_session(config: Config, client: "S3Client", p: pyaudio.PyA
 
     if record_audio(RECORDING_DURATION, filename, sample_rate, channels, chunk_size, device_index, p):
         file_path = os.path.join(DIR_TEMP_RECORDINGS, filename)
-        if UPLOAD_ON_EXIT_ONLY:
-            pending_uploads.append((file_path, filename))
-            log_message(f"Queued for upload at exit: {filename}")
-        else:
-            upload_queue.put((file_path, filename))
-            log_message(f"Enqueued upload: {filename}")
+        upload_queue.put((file_path, filename))
+        log_message(f"Enqueued upload: {filename}")
     else:
         log_message("Recording session failed, skipping upload")
 
@@ -255,9 +247,8 @@ def main():
     
     # Start background uploader if not deferring to exit
     uploader_thread: threading.Thread | None = None
-    if not UPLOAD_ON_EXIT_ONLY:
-        uploader_thread = threading.Thread(target=_uploader_worker, args=(config, client), daemon=True)
-        uploader_thread.start()
+    uploader_thread = threading.Thread(target=_uploader_worker, args=(config, client), daemon=True)
+    uploader_thread.start()
     
     log_message(f"Recording hours: {RECORDING_HOURS[0]}:00 - {RECORDING_HOURS[1]}:00")
     log_message(f"Recording duration per session: {RECORDING_DURATION} seconds")
@@ -269,9 +260,9 @@ def main():
                 record_and_upload_session(config, client, p)
                 
             else:
-                # Outside recording hours, sleep longer
+                # Outside recording hours
                 log_message("Outside recording hours, sleeping...")
-                time.sleep(300)  # 5 minutes
+                time.sleep(60)  # Wait before retrying
                 
         except KeyboardInterrupt:
             log_message("Recording stopped by user")
@@ -282,17 +273,18 @@ def main():
     
     # Graceful shutdown
     try:
-        if UPLOAD_ON_EXIT_ONLY:
-            log_message("Uploading all pending files before exit...")
-            for file_path, file_name in list(pending_uploads):
-                upload_to_s3(client, config, file_path, file_name)
-        else:
-            log_message("Waiting for pending uploads to finish...")
-            upload_queue.join()
-            # Signal uploader thread to exit
-            upload_queue.put(None)
-            if uploader_thread is not None:
-                uploader_thread.join(timeout=5)
+        for file_name in os.listdir("temp_recordings"):
+            log_message(f"Adding un-uploaded file: {file_name}")
+            file_path = os.path.join(folder, file_name)
+            if os.path.isfile(file_path):
+                upload_queue.put((file_path, filename))
+
+        log_message("Waiting for pending uploads to finish...")
+        upload_queue.join()
+        # Signal uploader thread to exit
+        upload_queue.put(None)
+        if uploader_thread is not None:
+            uploader_thread.join(timeout=5)
     finally:
         try:
             p.terminate()
