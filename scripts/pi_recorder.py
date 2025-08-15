@@ -135,6 +135,7 @@ def record_audio(duration: int, output_filename: str, sample_rate: int, channels
     try:
         # Create temp recordings directory
         os.makedirs(DIR_TEMP_RECORDINGS, exist_ok=True)
+        output_path = os.path.join(DIR_TEMP_RECORDINGS, output_filename)
 
         # Open stream
         stream = p.open(
@@ -146,33 +147,31 @@ def record_audio(duration: int, output_filename: str, sample_rate: int, channels
             input_device_index=device_index if device_index is not None else None,
         )
         
-        chosen_dev = device_index if device_index is not None else "default"
         log_message(
             f"Starting recording for {duration} seconds"
         )
         
-        frames = []
         total_chunks = int(sample_rate / chunk_size * duration)
-        for _ in range(total_chunks):
-            try:
-                data = stream.read(chunk_size, exception_on_overflow=False)
-                frames.append(data)
-            except Exception as e:
-                # Log and continue to avoid bailing out on transient overflows
-                log_message(f"[WARN] stream.read issue (continuing): {e}")
-        
-        # Stop and close the stream
-        stream.stop_stream()
-        stream.close()
-        
-        # Save the recorded data as a WAV file
-        output_path = os.path.join(DIR_TEMP_RECORDINGS, output_filename)
         with wave.open(output_path, 'wb') as wf:
             wf.setnchannels(channels)
             wf.setsampwidth(p.get_sample_size(FORMAT))
             wf.setframerate(sample_rate)
-            wf.writeframes(b''.join(frames))
+            for i in range(total_chunks):
+                try:
+                    data = stream.read(chunk_size, exception_on_overflow=False)
+                    wf.writeframes(data)   # write directly to file
+                    # Flush underlying file buffer every few chunks
+                    if i % 100 == 0:  # adjust frequency if needed
+                        wf._file.flush()
+                        os.fsync(wf._file.fileno())
+                except Exception as e:
+                    # Log and continue to avoid bailing out on transient overflows
+                    log_message(f"[WARN] stream.read issue (continuing): {e}")
         
+        # Stop and close the stream
+        stream.stop_stream()
+        stream.close()
+
         log_message(f"Recording completed: {output_filename}")
         return True
         
@@ -275,9 +274,9 @@ def main():
     try:
         for file_name in os.listdir("temp_recordings"):
             log_message(f"Adding un-uploaded file: {file_name}")
-            file_path = os.path.join(folder, file_name)
+            file_path = os.path.join(DIR_TEMP_RECORDINGS, file_name)
             if os.path.isfile(file_path):
-                upload_queue.put((file_path, filename))
+                upload_queue.put((file_path, file_name))
 
         log_message("Waiting for pending uploads to finish...")
         upload_queue.join()
